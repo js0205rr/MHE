@@ -1,0 +1,5 @@
+XMC/data/
+XMC/results/
+XMC/log/
+**/__pycache__/
+*.pyc

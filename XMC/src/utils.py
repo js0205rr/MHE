@@ -12,12 +12,18 @@ class Logger:
     def log(self, text, visual=True):
         if visual:
             print(text)
+        # 确保日志目录存在
+        log_dir = os.path.dirname(f'./log/{self.name}')
+        if log_dir and not os.path.exists(log_dir):
+            os.makedirs(log_dir, exist_ok=True)
         with open(f'./log/{self.name}', 'a') as f:
             f.write(datetime.datetime.now().strftime('%Y.%m.%d-%H:%M:%S') + text + '\n')
 
 def get_exp_name(dataset,bert,num_group):
-    name = [dataset, '' if bert == 'bert-base' else bert]
-    if dataset in ['wiki500k', 'amazon670k', 'amazon13m']:
+    # 将 bert 名称中的 '/' 替换为 '_'，避免路径问题
+    bert_safe = bert.replace('/', '_')
+    name = [dataset, '' if bert == 'bert-base' else bert_safe]
+    if dataset in ['wiki500k', 'amazon670k', 'amazon13m', 'lfamazontitles131k']:
         name.append(str(num_group))
 
     return '_'.join([i for i in name if i != ''])
@@ -72,3 +78,15 @@ def get_groups_v2(n_labels, num_group, num_ele_per_group):
     #assert len(group_y) == num_group and len(group_y[-1])==num_ele_per_group
     #return np.array(group_y,dtype=object)#, has_padding
     return np.array(group_y, dtype=None if len(group_y[-1])==len(group_y[-2]) else object)
+
+
+def get_balanced_groups(n_labels, num_group):
+    """Create exactly num_group contiguous groups with sizes differing by at most one."""
+    if num_group <= 0 or num_group > n_labels:
+        raise ValueError(f'num_group must be in [1, {n_labels}], got {num_group}')
+    groups = np.empty(num_group, dtype=object)
+    for idx, labels in enumerate(np.array_split(np.arange(n_labels), num_group)):
+        groups[idx] = labels
+    assert len(groups) == num_group
+    assert sum(len(labels) for labels in groups) == n_labels
+    return groups

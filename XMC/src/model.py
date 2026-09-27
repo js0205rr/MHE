@@ -1,7 +1,6 @@
 import tqdm
-import time
-import cProfile
 import numpy as np
+import os
 
 import torch
 from torch import nn
@@ -9,12 +8,59 @@ from torch import nn
 from transformers import BertTokenizer, BertConfig, BertModel
 from transformers import RobertaModel, RobertaConfig, RobertaTokenizer
 from transformers import XLNetTokenizer, XLNetModel, XLNetConfig
+from transformers import AutoTokenizer, AutoModel
 from tokenizers import BertWordPieceTokenizer
 from transformers import RobertaTokenizerFast
+from peft import LoraConfig, get_peft_model
 
 
-def get_bert(bert_name, path):
-    if 'roberta' in bert_name:
+def resolve_model_source(bert_name, path):
+    """Prefer an explicitly supplied local model, then bert_path/<model-name>."""
+    if os.path.isdir(bert_name):
+        return bert_name
+    if 'qwen' in bert_name.lower():
+        local_name = bert_name.rstrip('/\\').split('/')[-1]
+        local_candidate = os.path.join(path, local_name)
+        if os.path.isdir(local_candidate):
+            return local_candidate
+    return bert_name
+
+
+def get_bert(bert_name, path, use_lora=False, lora_r=16, lora_alpha=32,
+             lora_dropout=0.1, use_bf16=False):
+    if 'qwen' in bert_name.lower():
+        model_source = resolve_model_source(bert_name, path)
+        print(f'load Qwen model: {model_source}')
+        # 使用AutoTokenizer和AutoModel加载Qwen模型
+        bert = AutoModel.from_pretrained(
+            model_source,
+            torch_dtype=torch.bfloat16 if use_bf16 else torch.float32,
+            device_map="auto",
+            trust_remote_code=True,
+            local_files_only=os.path.isdir(model_source),
+            use_cache=False,
+            output_hidden_states=True
+        )
+        
+        # 启用梯度检查点
+        bert.gradient_checkpointing_enable()
+        
+        # 如果启用LoRA，配置并应用LoRA
+        if use_lora:
+            lora_config = LoraConfig(
+                r=lora_r,
+                lora_alpha=lora_alpha,
+                target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+                lora_dropout=lora_dropout,
+                bias="none",
+                task_type="FEATURE_EXTRACTION"
+            )
+            bert = get_peft_model(bert, lora_config)
+            print(f"LoRA配置完成: r={lora_r}, alpha={lora_alpha}, dropout={lora_dropout}, target_modules={lora_config.target_modules}")
+        
+        print(f"Qwen模型hidden_size: {bert.config.hidden_size}")
+        
+    elif 'roberta' in bert_name:
         print('load roberta-base')
         model_config = RobertaConfig.from_pretrained(path+'roberta-base')
         model_config.output_hidden_states = True
@@ -34,8 +80,10 @@ def get_bert(bert_name, path):
 
 class XMLMHE(nn.Module):
     def __init__(self, n_labels, group_y=None, bert='bert-base', bert_path='../NLP-Model/', feature_layers=5, dropout=0.5, update_count=1,
-                 candidates_topk=10, 
-                 use_swa=True, swa_warmup_epoch=10, swa_update_step=200, hidden_dim=300):
+                 candidates_topk=10,
+                 use_swa=False, swa_warmup_epoch=10, swa_update_step=200, hidden_dim=300,
+                 use_lora=False, lora_r=16, lora_alpha=32, lora_dropout=0.1,
+                 use_bf16=False):
         super(XMLMHE, self).__init__()
 
         self.use_swa = use_swa
@@ -43,6 +91,7 @@ class XMLMHE(nn.Module):
         self.swa_update_step = swa_update_step
         self.swa_state = {}
         self.path = bert_path
+        self.model_source = resolve_model_source(bert, bert_path)
 
         self.update_count = update_count
 
@@ -50,9 +99,27 @@ class XMLMHE(nn.Module):
 
         print('swa', self.use_swa, self.swa_warmup_epoch, self.swa_update_step, self.swa_state)
         print('update_count', self.update_count)
+        
+        # LoRA参数
+        self.use_lora = use_lora
+        self.lora_r = lora_r
+        self.lora_alpha = lora_alpha
+        self.lora_dropout = lora_dropout
+        self.use_bf16 = use_bf16
+        
+        print(f'LoRA配置: use_lora={use_lora}, r={lora_r}, alpha={lora_alpha}, dropout={lora_dropout}')
+        print(f'BF16配置: use_bf16={use_bf16}')
 
-        self.bert_name, self.bert = bert, get_bert(bert,bert_path)
-        self.feature_layers, self.drop_out = feature_layers, nn.Dropout(dropout)
+        self.bert_name, self.bert = bert, get_bert(
+            bert, bert_path, use_lora, lora_r, lora_alpha, lora_dropout, use_bf16)
+        if 'qwen' in self.bert_name.lower():
+            effective_feature_layers = 1
+            print(f"Set feature_layers to {effective_feature_layers} for Qwen model")
+        else:
+            effective_feature_layers = feature_layers
+        
+        self.feature_layers = effective_feature_layers
+        self.drop_out = nn.Dropout(dropout)
 
         self.group_y = group_y
         if self.group_y is not None:
@@ -73,8 +140,10 @@ class XMLMHE(nn.Module):
         if group_gd is not None:
             logits += group_gd
         scores, indices = torch.topk(logits, k=self.candidates_topk)
-        scores, indices = scores.cpu().detach().numpy(), indices.cpu().detach().numpy()
+        scores = scores.float().cpu().detach().numpy()
+        indices = indices.cpu().detach().numpy()
         candidates, candidates_scores = [], []
+
         for index, score in zip(indices, scores):
             candidates.append(self.group_y[index])
             candidates_scores.append([np.full(c.shape, s) for c, s in zip(candidates[-1], score)])
@@ -89,15 +158,21 @@ class XMLMHE(nn.Module):
                 labels=None, group_labels=None, candidates=None):
         is_training = labels is not None
 
-        outs = self.bert(
-            input_ids,
-            attention_mask=attention_mask,
-            token_type_ids=token_type_ids
-        )[-1]
-
-        out = torch.cat([outs[-i][:, 0] for i in range(1, self.feature_layers+1)], dim=-1)
+        if 'qwen' in self.bert_name.lower():
+        # Qwen 模型：使用 mean pooling 获取句子向量
+            bert_out = self.bert(input_ids, attention_mask=attention_mask)
+            last_hidden = bert_out.last_hidden_state
+            mask_expanded = attention_mask.unsqueeze(-1).to(dtype=last_hidden.dtype)
+            out = (last_hidden * mask_expanded).sum(dim=1) / mask_expanded.sum(dim=1).clamp(min=1e-9)
+        else:
+        # BERT 类模型：取最后 feature_layers 层的 [CLS] 拼接
+            bert_out = self.bert(input_ids, attention_mask=attention_mask, token_type_ids=token_type_ids)
+            outs = bert_out[-1]   # 假设这是隐藏状态元组
+            out = torch.cat([outs[-i][:, 0] for i in range(1, self.feature_layers+1)], dim=-1)
+            
         out = self.drop_out(out)
         group_logits = self.l0(out)
+
         if self.group_y is None:
             logits = group_logits
             if is_training:
@@ -131,8 +206,8 @@ class XMLMHE(nn.Module):
                                 new_labels[-1][j] = 1.0
                                 break
                 bs = be
-            labels = torch.stack(new_labels).cuda()
-        candidates, group_candidates_scores =  torch.LongTensor(candidates).cuda(), torch.Tensor(group_candidates_scores).cuda()
+            labels = torch.stack(new_labels).to(input_ids.device)
+        candidates, group_candidates_scores = torch.LongTensor(candidates).to(input_ids.device), torch.Tensor(group_candidates_scores).to(input_ids.device)
 
         emb = self.l1(out)
         embed_weights = self.embed(candidates)
@@ -178,7 +253,12 @@ class XMLMHE(nn.Module):
         if 'roberta' in self.bert_name:
             tokenizer = RobertaTokenizerFast.from_pretrained(self.path+'roberta-base', do_lower_case=True)
         elif 'xlnet' in self.bert_name:
-            tokenizer = XLNetTokenizer.from_pretrained(self.path+'xlnet-base-cased') 
+            tokenizer = XLNetTokenizer.from_pretrained(self.path+'xlnet-base-cased')
+        elif 'qwen' in self.bert_name.lower():
+            tokenizer = AutoTokenizer.from_pretrained(
+                self.model_source,
+                trust_remote_code=True,
+                local_files_only=os.path.isdir(self.model_source))
         else:
             tokenizer = BertWordPieceTokenizer(
                 "data/.bert-base-uncased-vocab.txt",
@@ -192,6 +272,12 @@ class XMLMHE(nn.Module):
         elif 'xlnet' in self.bert_name:
             print('load xlnet-base-cased tokenizer')
             tokenizer = XLNetTokenizer.from_pretrained(self.path+'xlnet-base-cased')
+        elif 'qwen' in self.bert_name.lower():
+            print(f'load Qwen tokenizer: {self.model_source}')
+            tokenizer = AutoTokenizer.from_pretrained(
+                self.model_source,
+                trust_remote_code=True,
+                local_files_only=os.path.isdir(self.model_source))
         else:
             print('load bert-base-uncased tokenizer')
             tokenizer = BertTokenizer.from_pretrained(self.path+'bert-base-uncased', do_lower_case=True)
@@ -200,20 +286,20 @@ class XMLMHE(nn.Module):
     def get_accuracy(self, candidates, logits, labels):
         if candidates is not None:
             candidates = candidates.detach().cpu()
-        scores, indices = torch.topk(logits.detach().cpu(), k=10)
+        _, indices = torch.topk(logits.detach().cpu(), k=10)
 
         acc1, acc3, acc5, total = 0, 0, 0, 0
         for i, l in enumerate(labels):
             if candidates is not None:
                 l = set(l[l>-1])
-                labels = candidates[i][indices[i]].numpy()
+                pred = candidates[i][indices[i]].numpy()
             else:
                 l = set(np.nonzero(l)[0])
-                labels = indices[i, :5].numpy()
+                pred = indices[i, :5].numpy()
 
-            acc1 += len(set([labels[0]]) & l)
-            acc3 += len(set(labels[:3]) & l)
-            acc5 += len(set(labels[:5]) & l)
+            acc1 += len(set([pred[0]]) & l)
+            acc3 += len(set(pred[:3]) & l)
+            acc5 += len(set(pred[:5]) & l)
             total += 1
 
         return total, acc1, acc3, acc5
@@ -235,8 +321,7 @@ class XMLMHE(nn.Module):
 
         with torch.set_grad_enabled(mode == 'train'):
             for step, data in enumerate(dataloader):
-                batch = tuple(t for t in data)
-                have_group = len(batch) > 4
+                batch = data
                 inputs = {'input_ids':      batch[0].cuda(),
                           'attention_mask': batch[1].cuda(),
                           'token_type_ids': batch[2].cuda()}
@@ -246,7 +331,12 @@ class XMLMHE(nn.Module):
                         inputs['group_labels'] = batch[4].cuda()
                         inputs['candidates'] = batch[5].cuda()
 
-                outputs = self(**inputs)
+                # For Qwen model, use torch.amp.autocast to enable bfloat16 mixed precision
+                if 'qwen' in self.bert_name.lower() and self.use_bf16:
+                    with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
+                        outputs = self(**inputs)
+                else:
+                    outputs = self(**inputs)
 
                 bar.update(1)
 
@@ -289,13 +379,16 @@ class XMLMHE(nn.Module):
         self.eval()
 
         for step, data in enumerate(eval_loader):
-            batch = tuple(t for t in data)
-            have_group = len(batch) > 4
+            batch = data
             inputs = {'input_ids':      batch[0].cuda(),
                         'attention_mask': batch[1].cuda(),
                         'token_type_ids': batch[2].cuda()}
 
-            outputs = self(**inputs)
+            if 'qwen' in self.bert_name.lower() and self.use_bf16:
+                with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
+                    outputs = self(**inputs)
+            else:
+                outputs = self(**inputs)
 
             bar.update(1)
             labels = batch[3]
@@ -308,6 +401,11 @@ class XMLMHE(nn.Module):
                 p3 = acc3 / total / 3
                 p5 = acc5 / total / 5
                 bar.set_postfix(p1=p1, p3=p3, p5=p5)
+
+                if mode=='test':
+                    _scores, _indices = torch.topk(logits.detach().cpu(), k=100)
+                    pred_scores.append(_scores.cpu())
+                    pred_labels.append(_indices.cpu())
             else:
                 group_labels = batch[4]
                 group_logits, candidates, logits = outputs
@@ -323,12 +421,12 @@ class XMLMHE(nn.Module):
                 g_p3 = g_acc3 / total / 3
                 g_p5 = g_acc5 / total / 5
                 bar.set_postfix(p1=p1, p3=p3, p5=p5, g_p1=g_p1, g_p3=g_p3, g_p5=g_p5)
-            
-            if mode=='test':
-                _scores, _indices = torch.topk(logits.detach().cpu(), k=100)
-                _labels = torch.stack([candidates[i][_indices[i]] for i in range(_indices.shape[0])], dim=0)
-                pred_scores.append(_scores.cpu())
-                pred_labels.append(_labels.cpu())
+
+                if mode=='test':
+                    _scores, _indices = torch.topk(logits.detach().cpu(), k=100)
+                    _labels = torch.stack([candidates[i][_indices[i]] for i in range(_indices.shape[0])], dim=0)
+                    pred_scores.append(_scores.cpu())
+                    pred_labels.append(_labels.cpu())
             
         bar.close()
         self.swa_swap_params()
@@ -364,8 +462,7 @@ class XMLMHE(nn.Module):
 
         with torch.set_grad_enabled(mode == 'train'):
             for step, data in enumerate(dataloader):
-                batch = tuple(t for t in data)
-                have_group = len(batch) > 4
+                batch = data
                 inputs = {'input_ids':      batch[0].cuda(),
                           'attention_mask': batch[1].cuda(),
                           'token_type_ids': batch[2].cuda()}
@@ -375,7 +472,11 @@ class XMLMHE(nn.Module):
                         inputs['group_labels'] = batch[4].cuda()
                         inputs['candidates'] = batch[5].cuda()
 
-                outputs = self(**inputs)
+                if 'qwen' in self.bert_name.lower() and self.use_bf16:
+                    with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
+                        outputs = self(**inputs)
+                else:
+                    outputs = self(**inputs)
 
                 bar.update(1)
 
