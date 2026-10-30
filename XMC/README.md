@@ -34,6 +34,59 @@ Note that when 'num_group' greater than 0, MHE-XMC use MHE for the XMC task. Oth
 
 
 ## Training and Testing
+
+### Jina Embeddings v3 / LF-AmazonTitles-131K comparison
+
+The Jina r64 run uses the native Transformers checkpoint
+`jinaai/jina-embeddings-v3-hf` **without loading its pretrained rank-4 task
+adapters**. It applies a fresh LoRA to Jina attention and feed-forward linear
+layers (`q_proj`, `k_proj`, `v_proj`, `o_proj`, `fc1`, `fc2`). Its LoRA settings
+match the recorded Qwen r64 run (rank 64, alpha 128, dropout 0.1); the two
+architectures do not have identical modules or trainable parameter counts.
+The script keeps the same validation split, MHC heads, top-10 group routing,
+batch size, sequence length, epoch count, seed, and learning rates. Product
+titles remain lowercased. Qwen's `This product text:` prefix is not added to
+Jina input. Neither backbone is L2-normalized before the MHC heads.
+
+Install `requirements-jina-py312.txt` in a separate environment with a
+CUDA-enabled PyTorch. Put the complete Jina HF checkpoint in
+`$MODEL_ROOT/jina-embeddings-v3-hf` and the dataset in
+`$DATA_PATH/LF-AmazonTitles-131K`. Before a full run, check one real batch:
+
+```bash
+cd src
+python smoke_jina.py --bert_path "$MODEL_ROOT" --data_path "$DATA_PATH" --bf16
+cd ..
+```
+
+The smoke check reads the same train/validation split and one real training
+batch. It exercises tokenizer, LoRA and head gradients, group routing, and
+label scores. A full training run requires a unique tag and refuses to
+overwrite an existing checkpoint:
+
+```bash
+DATA_PATH=/path/to/data MODEL_ROOT=/path/to/pretrained RUN_TAG=jina_r64_seed6088_v1 \
+  bash run_lf_amazontitles_131k_jina_h2_r64.sh
+```
+
+The script trains only after it is explicitly launched. Select checkpoints
+on the 4000-item validation split; evaluate the official test separately.
+Each validation epoch logs Label P@1/P@3/P@5, Group P@1/P@3/P@5,
+`group_recall@10`, and `candidate_recall`. The two recall values average
+per-document recall: the fraction of each document's true groups in the
+top-10 routed groups, and the fraction of its true labels present in the
+actual routed candidate list. Checkpoint selection still uses validation
+Label P@5.
+
+After selecting the best validation checkpoint, run the official test with
+`src/test_jina.py`. It evaluates all 134,835 test documents, saves the
+Top-10 routed label IDs and scores, and writes `metrics.json` with Label
+P@1/P@3/P@5, Group P@1/P@3/P@5, Group Recall@10, Candidate Recall,
+and SHA-256 hashes. The saved Top-10 ordering is independently checked
+against the in-loop P@k calculation; requesting a separate Top-100 sort
+can order tied scores differently.
+
+### Original MHE training
 Clone the code repository
 ```git
 git clone git@github.com:Anoise/MHE.git

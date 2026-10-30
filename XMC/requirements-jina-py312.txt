@@ -1,0 +1,11 @@
+# Install in a separate environment from the recorded Qwen r64 run.
+# Jina's native HF checkpoint requires the Transformers JinaEmbeddingsV3 model.
+transformers==5.6.2
+peft==0.20.0
+accelerate>=1.7,<2
+safetensors>=0.6,<1
+tokenizers>=0.21,<1
+scikit-learn>=1.5,<2
+pandas>=2.2,<4
+numpy>=1.26,<3
+tqdm>=4.67,<5

@@ -14,11 +14,15 @@ from transformers import RobertaTokenizerFast
 from peft import LoraConfig, get_peft_model
 
 
+def is_jina_v3(bert_name):
+    return 'jina-embeddings-v3' in bert_name.lower()
+
+
 def resolve_model_source(bert_name, path):
     """Prefer an explicitly supplied local model, then bert_path/<model-name>."""
     if os.path.isdir(bert_name):
         return bert_name
-    if 'qwen' in bert_name.lower():
+    if 'qwen' in bert_name.lower() or is_jina_v3(bert_name):
         local_name = bert_name.rstrip('/\\').split('/')[-1]
         local_candidate = os.path.join(path, local_name)
         if os.path.isdir(local_candidate):
@@ -28,7 +32,46 @@ def resolve_model_source(bert_name, path):
 
 def get_bert(bert_name, path, use_lora=False, lora_r=16, lora_alpha=32,
              lora_dropout=0.1, use_bf16=False):
-    if 'qwen' in bert_name.lower():
+    if is_jina_v3(bert_name):
+        if not bert_name.lower().endswith('jina-embeddings-v3-hf'):
+            raise ValueError('Use the native Transformers checkpoint jinaai/jina-embeddings-v3-hf for the Jina r64 experiment')
+        model_source = resolve_model_source(bert_name, path)
+        print(f'load Jina v3 model: {model_source}')
+        bert = AutoModel.from_pretrained(
+            model_source,
+            dtype=torch.bfloat16 if use_bf16 else torch.float32,
+            device_map='auto',
+            local_files_only=os.path.isdir(model_source),
+        )
+        if bert.config.hidden_size != 1024:
+            raise ValueError(f'Expected Jina v3 hidden_size=1024, got {bert.config.hidden_size}')
+        bert.config.use_cache = False
+        if hasattr(bert, 'gradient_checkpointing_enable'):
+            bert.gradient_checkpointing_enable()
+        if use_lora:
+            # Jina v3 HF's pretrained task adapters are not loaded here. Train a
+            # new adapter with the same rank/alpha/dropout as the Qwen r64 run.
+            target_modules = ['q_proj', 'k_proj', 'v_proj', 'o_proj', 'fc1', 'fc2']
+            matched = [name for name, module in bert.named_modules()
+                       if isinstance(module, nn.Linear)
+                       and any(name.endswith('.' + target) for target in target_modules)]
+            if len(matched) != bert.config.num_hidden_layers * len(target_modules):
+                raise RuntimeError(
+                    f'Jina LoRA target mismatch: expected {bert.config.num_hidden_layers * len(target_modules)} '
+                    f'linear layers, found {len(matched)}. Sample: {matched[:8]}')
+            lora_config = LoraConfig(
+                r=lora_r,
+                lora_alpha=lora_alpha,
+                target_modules=target_modules,
+                lora_dropout=lora_dropout,
+                bias='none',
+                task_type='FEATURE_EXTRACTION',
+            )
+            bert = get_peft_model(bert, lora_config)
+            print(f'Jina LoRA配置完成: r={lora_r}, alpha={lora_alpha}, dropout={lora_dropout}, '
+                  f'target_modules={target_modules}, matched_layers={len(matched)}')
+        print(f'Jina模型hidden_size: {bert.config.hidden_size}')
+    elif 'qwen' in bert_name.lower():
         model_source = resolve_model_source(bert_name, path)
         print(f'load Qwen model: {model_source}')
         # 使用AutoTokenizer和AutoModel加载Qwen模型
@@ -112,9 +155,9 @@ class XMLMHE(nn.Module):
 
         self.bert_name, self.bert = bert, get_bert(
             bert, bert_path, use_lora, lora_r, lora_alpha, lora_dropout, use_bf16)
-        if 'qwen' in self.bert_name.lower():
+        if 'qwen' in self.bert_name.lower() or is_jina_v3(self.bert_name):
             effective_feature_layers = 1
-            print(f"Set feature_layers to {effective_feature_layers} for Qwen model")
+            print(f"Set feature_layers to {effective_feature_layers} for embedding backbone")
         else:
             effective_feature_layers = feature_layers
         
@@ -158,8 +201,8 @@ class XMLMHE(nn.Module):
                 labels=None, group_labels=None, candidates=None):
         is_training = labels is not None
 
-        if 'qwen' in self.bert_name.lower():
-        # Qwen 模型：使用 mean pooling 获取句子向量
+        if 'qwen' in self.bert_name.lower() or is_jina_v3(self.bert_name):
+        # Embedding backbones: masked mean pooling; keep the Qwen r64 head input scale.
             bert_out = self.bert(input_ids, attention_mask=attention_mask)
             last_hidden = bert_out.last_hidden_state
             mask_expanded = attention_mask.unsqueeze(-1).to(dtype=last_hidden.dtype)
@@ -254,7 +297,7 @@ class XMLMHE(nn.Module):
             tokenizer = RobertaTokenizerFast.from_pretrained(self.path+'roberta-base', do_lower_case=True)
         elif 'xlnet' in self.bert_name:
             tokenizer = XLNetTokenizer.from_pretrained(self.path+'xlnet-base-cased')
-        elif 'qwen' in self.bert_name.lower():
+        elif 'qwen' in self.bert_name.lower() or is_jina_v3(self.bert_name):
             tokenizer = AutoTokenizer.from_pretrained(
                 self.model_source,
                 trust_remote_code=True,
@@ -272,8 +315,8 @@ class XMLMHE(nn.Module):
         elif 'xlnet' in self.bert_name:
             print('load xlnet-base-cased tokenizer')
             tokenizer = XLNetTokenizer.from_pretrained(self.path+'xlnet-base-cased')
-        elif 'qwen' in self.bert_name.lower():
-            print(f'load Qwen tokenizer: {self.model_source}')
+        elif 'qwen' in self.bert_name.lower() or is_jina_v3(self.bert_name):
+            print(f'load embedding tokenizer: {self.model_source}')
             tokenizer = AutoTokenizer.from_pretrained(
                 self.model_source,
                 trust_remote_code=True,
@@ -304,6 +347,25 @@ class XMLMHE(nn.Module):
 
         return total, acc1, acc3, acc5
 
+    @staticmethod
+    def get_routing_recall(group_logits, group_labels, candidates, labels, topk=10):
+        """Per-document recall of true groups and labels in routed candidates."""
+        predicted_groups = torch.topk(group_logits.detach().cpu(), k=topk, dim=1).indices
+        true_groups = group_labels.detach().cpu()
+        group_counts = true_groups.sum(dim=1)
+        group_hits = true_groups.gather(dim=1, index=predicted_groups).sum(dim=1)
+
+        true_labels = labels.detach().cpu()
+        routed_labels = candidates.detach().cpu()
+        valid_labels = true_labels >= 0
+        label_counts = valid_labels.sum(dim=1)
+        label_hits = ((true_labels.unsqueeze(2) == routed_labels.unsqueeze(1))
+                      & valid_labels.unsqueeze(2)).any(dim=2).sum(dim=1)
+
+        group_recall = torch.where(group_counts > 0, group_hits / group_counts.clamp_min(1), 0)
+        candidate_recall = torch.where(label_counts > 0, label_hits / label_counts.clamp_min(1), 0)
+        return group_recall.sum().item(), candidate_recall.sum().item(), true_labels.shape[0]
+
 
     def train_epoch(self, epoch, dataloader, optimizer,
                   mode='train', eval_loader=None, eval_step=20000, log=None):
@@ -332,7 +394,7 @@ class XMLMHE(nn.Module):
                         inputs['candidates'] = batch[5].cuda()
 
                 # For Qwen model, use torch.amp.autocast to enable bfloat16 mixed precision
-                if 'qwen' in self.bert_name.lower() and self.use_bf16:
+                if ('qwen' in self.bert_name.lower() or is_jina_v3(self.bert_name)) and self.use_bf16:
                     with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
                         outputs = self(**inputs)
                 else:
@@ -363,13 +425,16 @@ class XMLMHE(nn.Module):
 
         return train_loss
 
-    def eval_epoch(self, epoch, eval_loader, log=None, mode='eval'):
+    @torch.no_grad()
+    def eval_epoch(self, epoch, eval_loader, log=None, mode='eval', prediction_topk=100):
         
         bar = tqdm.tqdm(total=len(eval_loader))
         p1, p3, p5 = 0, 0, 0
         g_p1, g_p3, g_p5 = 0, 0, 0
         total, acc1, acc3, acc5 = 0, 0, 0, 0
         g_acc1, g_acc3, g_acc5 = 0, 0, 0
+        group_recall_sum, candidate_recall_sum, recall_count = 0.0, 0.0, 0
+        self.last_routing_metrics = None
 
         pred_scores, pred_labels = [], []
 
@@ -384,7 +449,7 @@ class XMLMHE(nn.Module):
                         'attention_mask': batch[1].cuda(),
                         'token_type_ids': batch[2].cuda()}
 
-            if 'qwen' in self.bert_name.lower() and self.use_bf16:
+            if ('qwen' in self.bert_name.lower() or is_jina_v3(self.bert_name)) and self.use_bf16:
                 with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
                     outputs = self(**inputs)
             else:
@@ -403,12 +468,18 @@ class XMLMHE(nn.Module):
                 bar.set_postfix(p1=p1, p3=p3, p5=p5)
 
                 if mode=='test':
-                    _scores, _indices = torch.topk(logits.detach().cpu(), k=100)
+                    _scores, _indices = torch.topk(logits.detach().cpu(), k=prediction_topk)
                     pred_scores.append(_scores.cpu())
                     pred_labels.append(_indices.cpu())
             else:
                 group_labels = batch[4]
                 group_logits, candidates, logits = outputs
+                gr, cr, count = self.get_routing_recall(
+                    group_logits, group_labels, candidates, labels,
+                    topk=self.candidates_topk)
+                group_recall_sum += gr
+                candidate_recall_sum += cr
+                recall_count += count
                 _total, _acc1, _acc3, _acc5 = self.get_accuracy(candidates, logits, labels.cpu().numpy())
                 total += _total; acc1 += _acc1; acc3 += _acc3; acc5 += _acc5
                 p1 = acc1 / total
@@ -423,13 +494,28 @@ class XMLMHE(nn.Module):
                 bar.set_postfix(p1=p1, p3=p3, p5=p5, g_p1=g_p1, g_p3=g_p3, g_p5=g_p5)
 
                 if mode=='test':
-                    _scores, _indices = torch.topk(logits.detach().cpu(), k=100)
+                    _scores, _indices = torch.topk(logits.detach().cpu(), k=prediction_topk)
                     _labels = torch.stack([candidates[i][_indices[i]] for i in range(_indices.shape[0])], dim=0)
                     pred_scores.append(_scores.cpu())
                     pred_labels.append(_labels.cpu())
             
         bar.close()
         self.swa_swap_params()
+        self.last_eval_metrics = {
+            'label_p1': p1,
+            'label_p3': p3,
+            'label_p5': p5,
+            'group_p1': g_p1,
+            'group_p3': g_p3,
+            'group_p5': g_p5,
+            'evaluated_documents': total,
+        }
+        if recall_count:
+            self.last_routing_metrics = {
+                'group_recall_at10': group_recall_sum / recall_count,
+                'candidate_recall': candidate_recall_sum / recall_count,
+            }
+            self.last_eval_metrics.update(self.last_routing_metrics)
         if mode=='test':
             return torch.cat(pred_scores, dim=0).numpy(), torch.cat(pred_labels, dim=0).numpy() if len(pred_labels) != 0 else None
 
@@ -472,7 +558,7 @@ class XMLMHE(nn.Module):
                         inputs['group_labels'] = batch[4].cuda()
                         inputs['candidates'] = batch[5].cuda()
 
-                if 'qwen' in self.bert_name.lower() and self.use_bf16:
+                if ('qwen' in self.bert_name.lower() or is_jina_v3(self.bert_name)) and self.use_bf16:
                     with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
                         outputs = self(**inputs)
                 else:

@@ -135,7 +135,12 @@ class MDataset(Dataset):
         token_type_ids = [0] * len(input_ids)
 
         padding_length = self.max_length - len(input_ids)
-        input_ids = input_ids + ([0] * padding_length)
+        # Jina's tokenizer uses pad_token_id=1. Preserve the existing Qwen
+        # padding convention so its recorded r64 baseline remains comparable.
+        pad_token_id = (self.tokenizer.pad_token_id
+                        if self.model_name and 'jina-embeddings-v3' in self.model_name.lower()
+                        else 0)
+        input_ids = input_ids + ([pad_token_id] * padding_length)
         attention_mask = attention_mask + ([0] * padding_length)
         token_type_ids = token_type_ids + ([0] * padding_length)
 

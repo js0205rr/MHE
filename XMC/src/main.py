@@ -6,9 +6,11 @@ from torch.utils.data import DataLoader
 from torch.optim import AdamW
 
 from dataset import MDataset, createDataCSV
-from model import XMLMHE
+from model import XMLMHE, is_jina_v3
 from utils import *
 import argparse
+import os
+import re
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--batch', type=int, required=False, default=16)
@@ -46,6 +48,7 @@ parser.add_argument('--eval_step', type=int, required=False, default=20000)
 parser.add_argument('--hidden_dim', type=int, required=False, default=300)
 
 parser.add_argument('--eval_model', action='store_true')
+parser.add_argument('--run_tag', type=str, default='', help='unique suffix for logs, checkpoints, and predictions')
 
 args = parser.parse_args()
 
@@ -80,15 +83,17 @@ def train(model, df, label_map):
     model.cuda()
     no_decay = ['bias', 'LayerNorm.weight']
 
-    # For Qwen models, use different learning rates for backbone and classification head
+# For embedding backbones, use different learning rates for backbone and classification head
     # Backbone (bert): args.lr, Classification head (l0, l1, embed): args.lr * 2
-    if 'qwen' in args.bert.lower():
+    if 'qwen' in args.bert.lower() or is_jina_v3(args.bert):
         backbone_params = []
         backbone_params_no_decay = []
         head_params = []
         head_params_no_decay = []
 
         for n, p in model.named_parameters():
+            if not p.requires_grad:
+                continue
             if 'bert' in n:
                 # Backbone parameters (including LoRA)
                 if any(nd in n for nd in no_decay):
@@ -109,6 +114,8 @@ def train(model, df, label_map):
             {'params': head_params_no_decay, 'weight_decay': 0.0, 'lr': args.lr * 2},
         ]
         print(f'Using differential learning rates: backbone={args.lr}, head={args.lr * 2}')
+        print(f'Trainable parameters: backbone={sum(p.numel() for p in backbone_params + backbone_params_no_decay)}, '
+              f'head={sum(p.numel() for p in head_params + head_params_no_decay)}')
     else:
         # For other models (BERT, RoBERTa, XLNet), use unified learning rate
         optimizer_grouped_parameters = [
@@ -136,6 +143,9 @@ def train(model, df, label_map):
         log_str = f'{epoch:>2}: {p1:.4f}, {p3:.4f}, {p5:.4f}, train_loss:{train_loss}'
         if args.num_group>0:
             log_str += f' {g_p1:.4f}, {g_p3:.4f}, {g_p5:.4f}'
+            routing = model.last_routing_metrics
+            log_str += (f' group_recall@10:{routing["group_recall_at10"]:.4f}'
+                        f' candidate_recall:{routing["candidate_recall"]:.4f}')
         if args.valid:
             log_str += ' valid'
         LOG.log(log_str)
@@ -150,6 +160,13 @@ def train(model, df, label_map):
 if __name__ == '__main__':
     init_seed(args.seed)
     exp_name = get_exp_name(args.dataset,args.bert,args.num_group)
+    if args.run_tag:
+        if not re.fullmatch(r'[A-Za-z0-9_-]+', args.run_tag):
+            raise ValueError('--run_tag may contain only letters, digits, underscores, and hyphens')
+        exp_name += '_' + args.run_tag
+    checkpoint_path = f'models/model-{exp_name}.bin'
+    if not args.eval_model and os.path.exists(checkpoint_path):
+        raise FileExistsError(f'Checkpoint already exists: {checkpoint_path}. Choose a new --run_tag.')
     LOG = Logger('log_'+exp_name)
     
     print(f'load {args.dataset} dataset...')
