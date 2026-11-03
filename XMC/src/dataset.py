@@ -95,7 +95,11 @@ class MDataset(Dataset):
         labels = [self.label_map[i] for i in self.df.label.values[idx].split() if i in self.label_map]
         review = ' '.join(review.split()[:max_len])
 
-        if self.model_name and 'qwen' in self.model_name.lower():
+        # J1-A and K1-A use the same product-title input protocol as the Qwen baseline.
+        qwen_or_kalm = self.model_name and (
+            'qwen' in self.model_name.lower()
+            or 'kalm-embedding-multilingual-mini-instruct-v2.5' in self.model_name.lower())
+        if qwen_or_kalm:
             if self.dataset_name == 'eurlex4k':
                 text = "This legal text: " + review
             elif self.dataset_name == 'lfamazontitles131k':
@@ -135,10 +139,12 @@ class MDataset(Dataset):
         token_type_ids = [0] * len(input_ids)
 
         padding_length = self.max_length - len(input_ids)
-        # Jina's tokenizer uses pad_token_id=1. Preserve the existing Qwen
-        # padding convention so its recorded r64 baseline remains comparable.
+        # Preserve Qwen's historical zero-padding convention for J1-A.
+        # KaLM and Jina use their own tokenizer pad IDs.
         pad_token_id = (self.tokenizer.pad_token_id
-                        if self.model_name and 'jina-embeddings-v3' in self.model_name.lower()
+                        if self.model_name and (
+                            'jina-embeddings-v3' in self.model_name.lower()
+                            or 'kalm-embedding-multilingual-mini-instruct-v2.5' in self.model_name.lower())
                         else 0)
         input_ids = input_ids + ([pad_token_id] * padding_length)
         attention_mask = attention_mask + ([0] * padding_length)

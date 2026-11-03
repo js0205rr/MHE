@@ -18,11 +18,19 @@ def is_jina_v3(bert_name):
     return 'jina-embeddings-v3' in bert_name.lower()
 
 
+def is_kalm_v25(bert_name):
+    return 'kalm-embedding-multilingual-mini-instruct-v2.5' in bert_name.lower()
+
+
+def is_embedding_backbone(bert_name):
+    return 'qwen' in bert_name.lower() or is_jina_v3(bert_name) or is_kalm_v25(bert_name)
+
+
 def resolve_model_source(bert_name, path):
     """Prefer an explicitly supplied local model, then bert_path/<model-name>."""
     if os.path.isdir(bert_name):
         return bert_name
-    if 'qwen' in bert_name.lower() or is_jina_v3(bert_name):
+    if is_embedding_backbone(bert_name):
         local_name = bert_name.rstrip('/\\').split('/')[-1]
         local_candidate = os.path.join(path, local_name)
         if os.path.isdir(local_candidate):
@@ -32,7 +40,36 @@ def resolve_model_source(bert_name, path):
 
 def get_bert(bert_name, path, use_lora=False, lora_r=16, lora_alpha=32,
              lora_dropout=0.1, use_bf16=False):
-    if is_jina_v3(bert_name):
+    if is_kalm_v25(bert_name):
+        model_source = resolve_model_source(bert_name, path)
+        print(f'load KaLM v2.5 model: {model_source}')
+        # The repository's custom Qwen2Model implements bidirectional attention.
+        bert = AutoModel.from_pretrained(
+            model_source,
+            torch_dtype=torch.bfloat16 if use_bf16 else torch.float32,
+            device_map='auto',
+            trust_remote_code=True,
+            local_files_only=os.path.isdir(model_source),
+            use_cache=False,
+        )
+        if bert.config.hidden_size != 896 or bert.config.is_causal:
+            raise ValueError('KaLM v2.5 must have hidden_size=896 and bidirectional attention')
+        bert.gradient_checkpointing_enable()
+        if use_lora:
+            target_modules = ['q_proj', 'k_proj', 'v_proj', 'o_proj',
+                              'gate_proj', 'up_proj', 'down_proj']
+            matched = [name for name, module in bert.named_modules()
+                       if isinstance(module, nn.Linear)
+                       and any(name.endswith('.' + target) for target in target_modules)]
+            expected = bert.config.num_hidden_layers * len(target_modules)
+            if len(matched) != expected:
+                raise RuntimeError(f'KaLM LoRA target mismatch: expected {expected}, found {len(matched)}')
+            bert = get_peft_model(bert, LoraConfig(
+                r=lora_r, lora_alpha=lora_alpha, lora_dropout=lora_dropout,
+                target_modules=target_modules, bias='none', task_type='FEATURE_EXTRACTION'))
+            print(f'KaLM LoRA configured: r={lora_r}, alpha={lora_alpha}, '
+                  f'dropout={lora_dropout}, matched_layers={len(matched)}')
+    elif is_jina_v3(bert_name):
         if not bert_name.lower().endswith('jina-embeddings-v3-hf'):
             raise ValueError('Use the native Transformers checkpoint jinaai/jina-embeddings-v3-hf for the Jina r64 experiment')
         model_source = resolve_model_source(bert_name, path)
@@ -101,6 +138,8 @@ def get_bert(bert_name, path, use_lora=False, lora_r=16, lora_alpha=32,
             bert = get_peft_model(bert, lora_config)
             print(f"LoRA配置完成: r={lora_r}, alpha={lora_alpha}, dropout={lora_dropout}, target_modules={lora_config.target_modules}")
         
+        if bert.config.hidden_size != 1024:
+            raise ValueError(f'Expected Qwen3 hidden_size=1024, got {bert.config.hidden_size}')
         print(f"Qwen模型hidden_size: {bert.config.hidden_size}")
         
     elif 'roberta' in bert_name:
@@ -126,7 +165,7 @@ class XMLMHE(nn.Module):
                  candidates_topk=10,
                  use_swa=False, swa_warmup_epoch=10, swa_update_step=200, hidden_dim=300,
                  use_lora=False, lora_r=16, lora_alpha=32, lora_dropout=0.1,
-                 use_bf16=False):
+                 use_bf16=False, pooling='mean'):
         super(XMLMHE, self).__init__()
 
         self.use_swa = use_swa
@@ -149,13 +188,16 @@ class XMLMHE(nn.Module):
         self.lora_alpha = lora_alpha
         self.lora_dropout = lora_dropout
         self.use_bf16 = use_bf16
+        if pooling not in ('mean', 'last_token'):
+            raise ValueError(f'Unknown pooling: {pooling}')
+        self.pooling = pooling
         
         print(f'LoRA配置: use_lora={use_lora}, r={lora_r}, alpha={lora_alpha}, dropout={lora_dropout}')
         print(f'BF16配置: use_bf16={use_bf16}')
 
         self.bert_name, self.bert = bert, get_bert(
             bert, bert_path, use_lora, lora_r, lora_alpha, lora_dropout, use_bf16)
-        if 'qwen' in self.bert_name.lower() or is_jina_v3(self.bert_name):
+        if is_embedding_backbone(self.bert_name):
             effective_feature_layers = 1
             print(f"Set feature_layers to {effective_feature_layers} for embedding backbone")
         else:
@@ -201,12 +243,18 @@ class XMLMHE(nn.Module):
                 labels=None, group_labels=None, candidates=None):
         is_training = labels is not None
 
-        if 'qwen' in self.bert_name.lower() or is_jina_v3(self.bert_name):
-        # Embedding backbones: masked mean pooling; keep the Qwen r64 head input scale.
+        if is_embedding_backbone(self.bert_name):
             bert_out = self.bert(input_ids, attention_mask=attention_mask)
             last_hidden = bert_out.last_hidden_state
-            mask_expanded = attention_mask.unsqueeze(-1).to(dtype=last_hidden.dtype)
-            out = (last_hidden * mask_expanded).sum(dim=1) / mask_expanded.sum(dim=1).clamp(min=1e-9)
+            if self.pooling == 'mean':
+                mask_expanded = attention_mask.unsqueeze(-1).to(dtype=last_hidden.dtype)
+                out = (last_hidden * mask_expanded).sum(dim=1) / mask_expanded.sum(dim=1).clamp(min=1e-9)
+            else:
+                positions = torch.arange(attention_mask.shape[1], device=input_ids.device)
+                last_positions = torch.where(attention_mask.bool(), positions, -1).max(dim=1).values
+                if (last_positions < 0).any():
+                    raise ValueError('Cannot use last-token pooling on an empty sequence')
+                out = last_hidden[torch.arange(input_ids.shape[0], device=input_ids.device), last_positions]
         else:
         # BERT 类模型：取最后 feature_layers 层的 [CLS] 拼接
             bert_out = self.bert(input_ids, attention_mask=attention_mask, token_type_ids=token_type_ids)
@@ -259,7 +307,10 @@ class XMLMHE(nn.Module):
 
         if is_training:
             loss_fn = torch.nn.BCEWithLogitsLoss()
-            loss = loss_fn(logits, labels) + loss_fn(group_logits, group_labels)
+            label_loss = loss_fn(logits, labels)
+            group_loss = loss_fn(group_logits, group_labels)
+            self.last_loss_components = (group_loss.detach(), label_loss.detach())
+            loss = label_loss + group_loss
             return logits, loss
         else:
             candidates_scores = torch.sigmoid(logits)
@@ -297,7 +348,7 @@ class XMLMHE(nn.Module):
             tokenizer = RobertaTokenizerFast.from_pretrained(self.path+'roberta-base', do_lower_case=True)
         elif 'xlnet' in self.bert_name:
             tokenizer = XLNetTokenizer.from_pretrained(self.path+'xlnet-base-cased')
-        elif 'qwen' in self.bert_name.lower() or is_jina_v3(self.bert_name):
+        elif is_embedding_backbone(self.bert_name):
             tokenizer = AutoTokenizer.from_pretrained(
                 self.model_source,
                 trust_remote_code=True,
@@ -315,7 +366,7 @@ class XMLMHE(nn.Module):
         elif 'xlnet' in self.bert_name:
             print('load xlnet-base-cased tokenizer')
             tokenizer = XLNetTokenizer.from_pretrained(self.path+'xlnet-base-cased')
-        elif 'qwen' in self.bert_name.lower() or is_jina_v3(self.bert_name):
+        elif is_embedding_backbone(self.bert_name):
             print(f'load embedding tokenizer: {self.model_source}')
             tokenizer = AutoTokenizer.from_pretrained(
                 self.model_source,
@@ -375,6 +426,7 @@ class XMLMHE(nn.Module):
         total, acc1, acc3, acc5 = 0, 0, 0, 0
         g_acc1, g_acc3, g_acc5 = 0, 0, 0
         train_loss = 0
+        group_loss_sum, label_loss_sum = 0.0, 0.0
         self.train()
         if self.use_swa and epoch == self.swa_warmup_epoch:
             self.swa_init()
@@ -394,7 +446,7 @@ class XMLMHE(nn.Module):
                         inputs['candidates'] = batch[5].cuda()
 
                 # For Qwen model, use torch.amp.autocast to enable bfloat16 mixed precision
-                if ('qwen' in self.bert_name.lower() or is_jina_v3(self.bert_name)) and self.use_bf16:
+                if is_embedding_backbone(self.bert_name) and self.use_bf16:
                     with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
                         outputs = self(**inputs)
                 else:
@@ -405,6 +457,10 @@ class XMLMHE(nn.Module):
                 loss = outputs[1]
                 loss /= self.update_count
                 train_loss += loss.item()
+                if self.group_y is not None:
+                    group_loss, label_loss = self.last_loss_components
+                    group_loss_sum += group_loss.item()
+                    label_loss_sum += label_loss.item()
 
                 loss.backward()
                 if step % self.update_count == 0:
@@ -423,6 +479,11 @@ class XMLMHE(nn.Module):
                     self.swa_step()
                 bar.set_postfix(loss=loss.item())
 
+        if self.group_y is not None:
+            self.last_train_losses = {
+                'group_bce': group_loss_sum / len(dataloader),
+                'label_bce': label_loss_sum / len(dataloader),
+            }
         return train_loss
 
     @torch.no_grad()
@@ -449,7 +510,7 @@ class XMLMHE(nn.Module):
                         'attention_mask': batch[1].cuda(),
                         'token_type_ids': batch[2].cuda()}
 
-            if ('qwen' in self.bert_name.lower() or is_jina_v3(self.bert_name)) and self.use_bf16:
+            if is_embedding_backbone(self.bert_name) and self.use_bf16:
                 with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
                     outputs = self(**inputs)
             else:
@@ -558,7 +619,7 @@ class XMLMHE(nn.Module):
                         inputs['group_labels'] = batch[4].cuda()
                         inputs['candidates'] = batch[5].cuda()
 
-                if ('qwen' in self.bert_name.lower() or is_jina_v3(self.bert_name)) and self.use_bf16:
+                if is_embedding_backbone(self.bert_name) and self.use_bf16:
                     with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
                         outputs = self(**inputs)
                 else:

@@ -35,7 +35,53 @@ Note that when 'num_group' greater than 0, MHE-XMC use MHE for the XMC task. Oth
 
 ## Training and Testing
 
-### Jina Embeddings v3 / LF-AmazonTitles-131K comparison
+### J1-A and K1-A backbone experiments / LF-AmazonTitles-131K
+
+J1-A loads the **merged** `HIT-TMG/JevEmbed-Qwen3-Embedding-0.6B` weights
+and creates a fresh MHC LoRA adapter. It uses last-token pooling, selecting
+the last position with `attention_mask=1` for each document. It does not load
+the released `lora/` adapter a second time. K1-A loads the original
+`KaLM-Embedding/KaLM-embedding-multilingual-mini-instruct-v2.5` custom
+`Qwen2Model` with its bidirectional attention and uses masked mean pooling.
+The two model revisions checked on 2026-10-30 were
+`e4a71aacd9b47ae6106fe57b7bf1c39992dc7ab1` (JevEmbed) and
+`52c687bbe81a62a223c924698b787ec05c9a978a` (KaLM).
+
+Both use the same lowercase product-title text and `This product text: `
+prefix, 32-token truncation, 512 fixed contiguous label groups, top-10 group
+routing, 300-dimensional label embeddings, group BCE plus candidate-label
+BCE, BF16, batch 16, rank-64/alpha-128/dropout-0.1 LoRA, seed 6088, and
+15 epochs. The backbone and head learning rates are `5e-5` and `1e-4`.
+Validation is the fixed 4,000-example split (`random_state=1240`), and
+checkpoint selection uses validation Label P@5. No test data is used to tune
+the model. The released backbones' sentence-transformer normalization layers
+are not used before the MHC heads.
+
+Put complete model repositories in `$MODEL_ROOT` under their repository
+basenames. Before training, run one real-batch compatibility check for each:
+
+```bash
+cd src
+python smoke_backbones.py --experiment j1a --bert_path "$MODEL_ROOT" --data_path "$DATA_PATH"
+python smoke_backbones.py --experiment k1a --bert_path "$MODEL_ROOT" --data_path "$DATA_PATH"
+cd ..
+```
+
+Launch the full 15-epoch runs with distinct tags so existing results remain
+untouched:
+
+```bash
+DATA_PATH=/path/to/data MODEL_ROOT=/path/to/pretrained RUN_TAG=j1a_v1 \
+  bash run_lf_amazontitles_131k_jev_j1a.sh
+DATA_PATH=/path/to/data MODEL_ROOT=/path/to/pretrained RUN_TAG=k1a_v1 \
+  bash run_lf_amazontitles_131k_kalm_k1a.sh
+```
+
+J1-A versus the recorded Qwen **mean-pooling** baseline changes both weights
+and pooling, so it does not isolate the effect of JevEmbed weights. The
+2-epoch Qwen last-token pilot is not a mature 15-epoch control.
+
+### Jina v3 base-only + fresh LoRA / LF-AmazonTitles-131K comparison
 
 The Jina r64 run uses the native Transformers checkpoint
 `jinaai/jina-embeddings-v3-hf` **without loading its pretrained rank-4 task
@@ -43,6 +89,9 @@ adapters**. It applies a fresh LoRA to Jina attention and feed-forward linear
 layers (`q_proj`, `k_proj`, `v_proj`, `o_proj`, `fc1`, `fc2`). Its LoRA settings
 match the recorded Qwen r64 run (rank 64, alpha 128, dropout 0.1); the two
 architectures do not have identical modules or trainable parameter counts.
+The recorded Jina validation and test results therefore do not measure its
+released `classification` task adapter. A clean comparison with that adapter
+requires a new MHC training run from epoch 0 and a separate checkpoint.
 The script keeps the same validation split, MHC heads, top-10 group routing,
 batch size, sequence length, epoch count, seed, and learning rates. Product
 titles remain lowercased. Qwen's `This product text:` prefix is not added to

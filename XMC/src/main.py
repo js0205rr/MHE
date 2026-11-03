@@ -6,7 +6,7 @@ from torch.utils.data import DataLoader
 from torch.optim import AdamW
 
 from dataset import MDataset, createDataCSV
-from model import XMLMHE, is_jina_v3
+from model import XMLMHE, is_embedding_backbone
 from utils import *
 import argparse
 import os
@@ -24,7 +24,7 @@ parser.add_argument('--bert', type=str, required=False, default='bert-base')
 parser.add_argument('--bert_path', type=str, required=False, default='../NLP-Model/')
 
 # LoRA 相关参数
-parser.add_argument('--use_lora', action='store_true', help='use LoRA for Qwen model')
+parser.add_argument('--use_lora', action='store_true', help='use LoRA for embedding backbone')
 parser.add_argument('--lora_rank', type=int, default=256, help='LoRA rank')
 parser.add_argument('--lora_alpha', type=int, default=256, help='LoRA alpha')
 parser.add_argument('--lora_dropout', type=float, default=0.0, help='LoRA dropout')
@@ -32,6 +32,7 @@ parser.add_argument('--lora_dropout', type=float, default=0.0, help='LoRA dropou
 parser.add_argument('--bf16', action='store_true', help='use bfloat16 mixed precision')
 
 parser.add_argument('--max_len', type=int, required=False, default=512)
+parser.add_argument('--pooling', choices=['mean', 'last_token'], default='mean')
 
 parser.add_argument('--valid', action='store_true')
 
@@ -85,7 +86,7 @@ def train(model, df, label_map):
 
 # For embedding backbones, use different learning rates for backbone and classification head
     # Backbone (bert): args.lr, Classification head (l0, l1, embed): args.lr * 2
-    if 'qwen' in args.bert.lower() or is_jina_v3(args.bert):
+    if is_embedding_backbone(args.bert):
         backbone_params = []
         backbone_params_no_decay = []
         head_params = []
@@ -128,6 +129,12 @@ def train(model, df, label_map):
 
 
     max_only_p5 = -1
+    LOG.log(f'configuration: backbone={args.bert}, source={model.model_source}, '
+            f'pooling={args.pooling}, seed={args.seed}, batch={args.batch}, '
+            f'max_len={args.max_len}, epochs={args.epoch}, lr={args.lr}, '
+            f'lora={args.use_lora}, rank={args.lora_rank}, alpha={args.lora_alpha}, '
+            f'lora_dropout={args.lora_dropout}, bf16={args.bf16}, swa={args.swa}, '
+            f'groups={args.num_group}, routed_groups={args.group_y_candidate_topk}')
     for epoch in range(0, args.epoch): ##
         train_loss = model.train_epoch(epoch, trainloader, optimizer, mode='train',
                                      eval_loader=validloader if args.valid else testloader,
@@ -142,6 +149,9 @@ def train(model, df, label_map):
 
         log_str = f'{epoch:>2}: {p1:.4f}, {p3:.4f}, {p5:.4f}, train_loss:{train_loss}'
         if args.num_group>0:
+            components = model.last_train_losses
+            log_str += (f' group_bce:{components["group_bce"]:.6f}'
+                        f' label_bce:{components["label_bce"]:.6f}')
             log_str += f' {g_p1:.4f}, {g_p3:.4f}, {g_p5:.4f}'
             routing = model.last_routing_metrics
             log_str += (f' group_recall@10:{routing["group_recall_at10"]:.4f}'
@@ -198,7 +208,8 @@ if __name__ == '__main__':
                         lora_r=args.lora_rank,
                         lora_alpha=args.lora_alpha,
                         lora_dropout=args.lora_dropout,
-                        use_bf16=args.bf16)
+                        use_bf16=args.bf16,
+                        pooling=args.pooling)
     
     if args.eval_model and args.dataset in ['wiki500k', 'amazon670k', 'amazon3m', 'lfamazontitles131k']:
         print(f'load models/model-{exp_name}.bin ......')
