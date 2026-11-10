@@ -9,6 +9,7 @@ from dataset import MDataset, createDataCSV
 from model import XMLMHE, is_embedding_backbone
 from utils import *
 import argparse
+import json
 import os
 import re
 
@@ -28,6 +29,8 @@ parser.add_argument('--use_lora', action='store_true', help='use LoRA for embedd
 parser.add_argument('--lora_rank', type=int, default=256, help='LoRA rank')
 parser.add_argument('--lora_alpha', type=int, default=256, help='LoRA alpha')
 parser.add_argument('--lora_dropout', type=float, default=0.0, help='LoRA dropout')
+parser.add_argument('--feature_dropout', type=float, default=0.5,
+                    help='dropout on the pooled features shared by the group and label heads')
 # 混合精度
 parser.add_argument('--bf16', action='store_true', help='use bfloat16 mixed precision')
 
@@ -50,8 +53,14 @@ parser.add_argument('--hidden_dim', type=int, required=False, default=300)
 
 parser.add_argument('--eval_model', action='store_true')
 parser.add_argument('--run_tag', type=str, default='', help='unique suffix for logs, checkpoints, and predictions')
+parser.add_argument('--no_save_checkpoint', action='store_true',
+                    help='train and validate without saving any checkpoint')
+parser.add_argument('--selection_metric', choices=['p1', 'p5'], default='p1',
+                    help='validation label precision used to select the saved checkpoint')
 
 args = parser.parse_args()
+if not 0.0 <= args.feature_dropout < 1.0:
+    parser.error('--feature_dropout must be in [0, 1)')
 
 
 def train(model, df, label_map):
@@ -128,12 +137,16 @@ def train(model, df, label_map):
     optimizer = AdamW(optimizer_grouped_parameters, lr=args.lr)
 
 
-    max_only_p5 = -1
+    best_selection_score = -1
     LOG.log(f'configuration: backbone={args.bert}, source={model.model_source}, '
             f'pooling={args.pooling}, seed={args.seed}, batch={args.batch}, '
             f'max_len={args.max_len}, epochs={args.epoch}, lr={args.lr}, '
             f'lora={args.use_lora}, rank={args.lora_rank}, alpha={args.lora_alpha}, '
-            f'lora_dropout={args.lora_dropout}, bf16={args.bf16}, swa={args.swa}, '
+            f'lora_dropout={args.lora_dropout}, feature_dropout={args.feature_dropout}, '
+            f'head_lr={args.lr * 2 if is_embedding_backbone(args.bert) else args.lr}, '
+            f'bf16={args.bf16}, swa={args.swa}, '
+            f'save_checkpoint={not args.no_save_checkpoint}, '
+            f'selection_metric=label_{args.selection_metric}, '
             f'groups={args.num_group}, routed_groups={args.group_y_candidate_topk}')
     for epoch in range(0, args.epoch): ##
         train_loss = model.train_epoch(epoch, trainloader, optimizer, mode='train',
@@ -160,12 +173,25 @@ def train(model, df, label_map):
             log_str += ' valid'
         LOG.log(log_str)
 
-        if max_only_p5 < p5:
-            max_only_p5 = p5
-            model.save_model(f'models/model-{exp_name}.bin')
-
-        if epoch >= args.epoch + 5 and max_only_p5 != p5:
-            break
+        selection_score = p1 if args.selection_metric == 'p1' else p5
+        if not args.no_save_checkpoint and best_selection_score < selection_score:
+            best_selection_score = selection_score
+            checkpoint_path = f'models/model-{exp_name}.bin'
+            temp_checkpoint_path = checkpoint_path + '.tmp'
+            model.save_model(temp_checkpoint_path)
+            os.replace(temp_checkpoint_path, checkpoint_path)
+            metadata_path = checkpoint_path + '.meta.json'
+            with open(metadata_path + '.tmp', 'w', encoding='utf-8') as metadata_file:
+                json.dump({'arguments': vars(args), 'model_source': model.model_source,
+                           'selected_epoch': epoch,
+                           'selection_metric': f'{"validation" if args.valid else "test"}_label_{args.selection_metric}',
+                           'selection_value': selection_score,
+                           'validation_label_p1': p1 if args.valid else None,
+                           'validation_label_p3': p3 if args.valid else None,
+                           'validation_label_p5': p5 if args.valid else None},
+                          metadata_file, indent=2, sort_keys=True)
+            os.replace(metadata_path + '.tmp', metadata_path)
+            LOG.log(f'checkpoint selected: epoch={epoch}, label_{args.selection_metric}={selection_score:.4f}, path={checkpoint_path}')
 
 if __name__ == '__main__':
     init_seed(args.seed)
@@ -208,6 +234,7 @@ if __name__ == '__main__':
                         lora_r=args.lora_rank,
                         lora_alpha=args.lora_alpha,
                         lora_dropout=args.lora_dropout,
+                        dropout=args.feature_dropout,
                         use_bf16=args.bf16,
                         pooling=args.pooling)
     
